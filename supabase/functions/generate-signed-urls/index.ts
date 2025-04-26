@@ -1,31 +1,36 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts"
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
-import { S3Client, GetObjectCommand } from "npm:@aws-sdk/client-s3";
-import { getSignedUrl } from "npm:@aws-sdk/s3-request-presigner";
+import { getSignedUrl } from "npm:@aws-sdk/cloudfront-signer";
 
+// CloudFront configuration
+const cloudFrontDomain = Deno.env.get('CLOUDFRONT_DOMAIN');
+const cloudFrontKeyPairId = Deno.env.get('CLOUDFRONT_KEY_PAIR_ID');
+const cloudFrontPrivateKey = Deno.env.get('CLOUDFRONT_PRIVATE_KEY');
+const cloudFrontExpiresIn = Deno.env.get('CLOUDFRONT_EXPIRES_IN');
 
-const s3Client = new S3Client({
-  region: Deno.env.get('AWS_REGION'),
-  credentials: {
-    accessKeyId: Deno.env.get('AWS_ACCESS_KEY_ID'),
-    secretAccessKey: Deno.env.get('AWS_SECRET_ACCESS_KEY')
-  }
-});
+// Validate environment variables
+if (!cloudFrontDomain || !cloudFrontKeyPairId || !cloudFrontPrivateKey) {
+  throw new Error('Missing required CloudFront configuration. Please check your environment variables.');
+}
 
-async function generateSignedUrl(objectUrl, expiresIn = 3600) {
+async function generateSignedUrl(objectUrl, expiresIn = cloudFrontExpiresIn) {
   try {
     const url = new URL(objectUrl);
     const pathParts = url.pathname.split('/').filter(part => part.length > 0);
     const folder = pathParts[0];
     const key = pathParts.slice(1).join('/');
     
-    const command = new GetObjectCommand({
-      Bucket: Deno.env.get('AWS_BUCKET_NAME'),
-      Key: `${folder}/${key}`
+    // Construct the CloudFront URL
+    const cloudFrontUrl = `https://${cloudFrontDomain}/${folder}/${key}`;
+    
+    // Generate signed URL using the decoded private key
+    const signedUrl = getSignedUrl({
+      url: cloudFrontUrl,
+      keyPairId: cloudFrontKeyPairId,
+      privateKey: cloudFrontPrivateKey,
+      dateLessThan: new Date(Date.now() + expiresIn * 1000).toISOString()
     });
     
-    // Generate signed URL
-    const signedUrl = await getSignedUrl(s3Client, command, { expiresIn });
     return signedUrl;
   } catch (error) {
     console.error('Error generating signed URL:', error);
@@ -78,12 +83,12 @@ Deno.serve(async (req) => {
       urlsToProcess.map(async (url) => {
         try {
           // Generate signed URL with 1-hour expiry
-          const signedUrl = await generateSignedUrl(url, 3600);
+          const signedUrl = await generateSignedUrl(url, cloudFrontExpiresIn);
           
           return {
             originalUrl: url,
             signedUrl,
-            expiresAt: new Date(Date.now() + 3600 * 1000).toISOString()
+            expiresAt: new Date(Date.now() + cloudFrontExpiresIn * 1000).toISOString()
           };
         } catch (error) {
           return {

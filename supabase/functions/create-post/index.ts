@@ -16,12 +16,10 @@ interface Video {
 
 interface Post {
   title: string;
-  category: string;
+  category_id: string;
   price: number;
   currency: string;
-  condition: string;
   location: string;
-  availability: string;
   contact_type: string;
   contact_value: string;
   description: string;
@@ -128,8 +126,8 @@ serve(async (req: Request) => {
 
     // Validate required post fields
     const requiredFields = [
-      'title', 'category', 'price', 'currency', 'condition',
-      'location', 'availability', 'contact_type', 'contact_value',
+      'title', 'category_id', 'price', 'currency',
+      'location', 'contact_type', 'contact_value',
       'description'
     ];
     
@@ -167,18 +165,16 @@ serve(async (req: Request) => {
       // Insert post and get its ID
       const postResult = await client.queryObject<{ id: string }>(
         `INSERT INTO posts (
-          title, category, price, currency, condition, location, availability,
+          title, category_id, price, currency, location,
           contact_type, contact_value, description, user_id
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
         RETURNING id`,
         [
           post.title,
-          post.category,
+          post.category_id,
           post.price,
           post.currency,
-          post.condition,
           post.location,
-          post.availability,
           post.contact_type,
           post.contact_value,
           post.description,

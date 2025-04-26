@@ -1,7 +1,13 @@
-import { serve } from 'https://deno.land/std@0.177.0/http/server.ts';
-import { Pool } from 'https://deno.land/x/postgres@v0.17.0/mod.ts';
-import * as postgres from 'https://deno.land/x/postgres@v0.17.0/mod.ts';
-import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
+// Follow this setup guide to integrate the Deno language server with your editor:
+// https://deno.land/manual/getting_started/setup_your_environment
+// This enables autocomplete, go to definition, etc.
+
+// Setup type definitions for built-in Supabase Runtime APIs
+import "jsr:@supabase/functions-js/edge-runtime.d.ts"
+import { corsHeaders } from "../_shared/cors.ts"
+import { executeQuery, getPool } from "../_shared/postgres-helper.ts"
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2"
+import * as postgres from "https://deno.land/x/postgres@v0.17.0/mod.ts"
 
 // Custom JSON stringifier to handle BigInt values
 const bigIntSafeJSONStringify = (data: any): string => {
@@ -9,6 +15,19 @@ const bigIntSafeJSONStringify = (data: any): string => {
     typeof value === 'bigint' ? Number(value) : value
   );
 };
+
+interface SearchParams {
+  query?: string;
+  min_price?: number;
+  max_price?: number;
+  location?: string;
+  category_id?: string;
+  limit?: number;
+  offset?: number;
+  sort_by?: 'created_at' | 'price' | 'like_count';
+  sort_direction?: 'asc' | 'desc';
+  currency?: string;
+}
 
 interface Photo {
   id: string;
@@ -44,30 +63,19 @@ interface Post {
   contact_type: string;
   contact_value: string;
   description: string;
-  user_id: string;
   created_at: string;
+  updated_at: string;
+  user_id: string;
+  category_id: string;
+  category_name: string;
   photos: Photo[];
   videos: Video[];
   like_count: number;
   is_liked_by_user: boolean;
   profile: Profile;
-  category_id: string;
-  category_name: string;
 }
-
-interface QueryParams {
-  limit?: number;
-  page?: number;
-}
-
-const pool = new Pool(
-  Deno.env.get('DATABASE_URL') || '',
-  3,
-  true
-);
 
 // Helper function to convert any BigInt values in an object to numbers
-// and properly format Date objects to ISO strings
 const processQueryResult = (obj: any): any => {
   if (obj === null || obj === undefined) {
     return obj;
@@ -98,13 +106,12 @@ const processQueryResult = (obj: any): any => {
       const value = obj[key];
       
       // Special handling for the created_at field
-      if (key === 'created_at' && value && typeof value === 'object') {
+      if ((key === 'created_at' || key === 'updated_at') && value && typeof value === 'object') {
         if (value instanceof Date) {
           converted[key] = value.toISOString();
         } else if (value.toString && typeof value.toString === 'function') {
           converted[key] = value.toString();
         } else {
-          // Fallback to ISO string for current date if we can't convert
           converted[key] = new Date().toISOString();
         }
       } else {
@@ -117,63 +124,104 @@ const processQueryResult = (obj: any): any => {
   return obj;
 };
 
-serve(async (req: Request) => {
+Deno.serve(async (req) => {
+  // Handle CORS preflight request
+  if (req.method === "OPTIONS") {
+    return new Response("ok", { headers: corsHeaders });
+  }
+
   try {
     const headers = {
       'Content-Type': 'application/json',
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'GET, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+      ...corsHeaders
     };
 
-    if (req.method === 'OPTIONS') {
-      return new Response(null, { status: 204, headers });
-    }
+    // Get request body
+    const body = await req.json() as SearchParams;
+    console.log("--------------------------------")
+    console.log(body);
+    console.log("--------------------------------")
+    const { 
+      query, 
+      min_price, 
+      max_price, 
+      location, 
+      category_id,
+      currency,
+      sort_by = 'created_at',
+      sort_direction = 'desc',
+      limit = 20, 
+      offset = 0 
+    } = body;
 
-    if (req.method !== 'GET') {
-      return new Response(
-        JSON.stringify({ 
-          success: false, 
-          error: 'Method not allowed' 
-        }),
-        { status: 405, headers }
-      );
-    }
-
-    // Parse query parameters
-    const url = new URL(req.url);
-    const params: QueryParams = {
-      limit: url.searchParams.has('limit') ? parseInt(url.searchParams.get('limit')!) : 10,
-      page: url.searchParams.has('page') ? parseInt(url.searchParams.get('page')!) : 1
-    };
-
-    // Validate limit and page
-    if (isNaN(params.limit!) || params.limit! <= 0 || params.limit! > 50) {
-      params.limit = 10;
-    }
-    
-    if (isNaN(params.page!) || params.page! < 1) {
-      params.page = 1;
-    }
-    
-    // Calculate offset from page number
-    const offset = (params.page! - 1) * params.limit!;
-
-    // Get a client from the pool
-    const client = await pool.connect();
+    // Connect to the database
+    const client = await getPool().connect();
 
     try {
+      // Build the query conditions
+      const conditions: string[] = [];
+      const queryParams: any[] = [];
+      let paramCounter = 1;
+
+      // Text search condition (if provided)
+      if (query) {
+        // Process the search term to handle partial words
+        // Split into words, ensure each ends with :* for prefix matching
+        const processedTerms = query
+          .split(' ')
+          .filter(Boolean)
+          .map(term => `${term}:*`)
+          .join(' & ');
+        
+        conditions.push(`(
+          title_search @@ to_tsquery('english', $${paramCounter++}) OR
+          to_tsvector('english', description) @@ to_tsquery('english', $${paramCounter++})
+        )`);
+        queryParams.push(processedTerms, processedTerms);
+      }
+
+      // Price range conditions
+      if (min_price !== undefined) {
+        conditions.push(`price >= $${paramCounter++}`);
+        queryParams.push(min_price);
+      }
+
+      if (max_price !== undefined) {
+        conditions.push(`price <= $${paramCounter++}`);
+        queryParams.push(max_price);
+      }
+
+      // Location filter
+      if (location) {
+        conditions.push(`location = $${paramCounter++}`);
+        queryParams.push(location);
+      }
+
+      // Category filter
+      if (category_id) {
+        conditions.push(`category_id = $${paramCounter++}`);
+        queryParams.push(category_id);
+      }
+
+      // Currency filter
+      if (currency) {
+        conditions.push(`currency = $${paramCounter++}`);
+        queryParams.push(currency);
+      }
+
+      const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+      
       // Get total count for pagination
-      const countQuery = `SELECT COUNT(*) as total FROM posts`;
-      const countResult = await client.queryObject<{ total: postgres.BigInt }>(countQuery);
+      const countQuery = `SELECT COUNT(*) as total FROM posts ${whereClause}`;
+      const countResult = await client.queryObject<{ total: postgres.BigInt }>(countQuery, queryParams);
       const total = Number(countResult.rows[0].total);
 
       // Build the main query with like count
-      const sortClause = `ORDER BY created_at DESC`;
-      
-      let paramCounter = 1;
+      const sortClause = `ORDER BY ${query && sort_by === 'created_at' ? 
+        `ts_rank(title_search, to_tsquery('english', $1)) DESC, created_at DESC` : 
+        `${sort_by} ${sort_direction}`}`;
       const paginationClause = `LIMIT $${paramCounter++} OFFSET $${paramCounter++}`;
-      const queryParams = [params.limit, offset];
+      queryParams.push(limit, offset);
 
       // Get posts with like count and user profile
       const postQuery = `
@@ -194,6 +242,7 @@ serve(async (req: Request) => {
           profiles pr ON p.user_id = pr.id
         LEFT JOIN
           categories c ON p.category_id = c.id
+        ${whereClause}
         GROUP BY 
           p.id, pr.id, c.id
         ${sortClause}
@@ -212,9 +261,8 @@ serve(async (req: Request) => {
             data: {
               posts: [],
               total,
-              limit: params.limit,
-              page: params.page,
-              total_pages: Math.ceil(total / params.limit!)
+              limit,
+              offset
             }
           }),
           { status: 200, headers }
@@ -315,7 +363,13 @@ serve(async (req: Request) => {
           updated_at: post.profile_updated_at
         },
         category_id: post.category_id || null,
-        category_name: post.category_name || null
+        category_name: post.category_name || null,
+        // Remove redundant fields that are now in profile
+        profile_id: undefined,
+        profile_username: undefined,
+        profile_name: undefined,
+        profile_created_at: undefined,
+        profile_updated_at: undefined
       }));
 
       // Return the response with safe JSON stringification
@@ -325,37 +379,45 @@ serve(async (req: Request) => {
           data: {
             posts: postsWithMedia,
             total,
-            limit: params.limit,
-            page: params.page,
-            total_pages: Math.ceil(total / params.limit!)
+            limit,
+            offset
           }
         }),
         { status: 200, headers }
       );
-
     } catch (error) {
-      console.error('Database error:', error);
-      
+      console.error("Database error:", error);
       return new Response(
-        JSON.stringify({ 
-          success: false, 
-          error: `Database error: ${error.message}` 
-        }),
-        { status: 500, headers }
+        JSON.stringify({ success: false, error: `Database error: ${error.message}` }),
+        { 
+          headers,
+          status: 500 
+        }
       );
     } finally {
       // Release the client back to the pool
       client.release();
     }
-
   } catch (error) {
-    console.error('Unexpected error:', error);
+    console.error("Error processing request:", error);
     return new Response(
-      JSON.stringify({ 
-        success: false, 
-        error: `Unexpected error: ${error.message}` 
-      }),
-      { status: 500, headers: { 'Content-Type': 'application/json' } }
+      JSON.stringify({ success: false, error: "An unexpected error occurred" }),
+      { 
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+        status: 500 
+      }
     );
   }
-});
+})
+
+/* To invoke locally:
+
+  1. Run `supabase start` (see: https://supabase.com/docs/reference/cli/supabase-start)
+  2. Make an HTTP request:
+
+  curl -i --location --request POST 'http://127.0.0.1:54321/functions/v1/search-results' \
+    --header 'Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZS1kZW1vIiwicm9sZSI6ImFub24iLCJleHAiOjE5ODM4MTI5OTZ9.CRXP1A7WOeoJeXxjNni43kdQwgnWNReilDMblYTn_I0' \
+    --header 'Content-Type: application/json' \
+    --data '{"query":"furniture", "min_price": 50, "max_price": 500, "category_id": "123e4567-e89b-12d3-a456-426614174000"}'
+
+*/
