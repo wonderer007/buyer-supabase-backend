@@ -1,3 +1,12 @@
+// Follow this setup guide to integrate the Deno language server with your editor:
+// https://deno.land/manual/getting_started/setup_your_environment
+// This enables autocomplete, go to definition, etc.
+
+// Setup type definitions for built-in Supabase Runtime APIs
+import "jsr:@supabase/functions-js/edge-runtime.d.ts"
+
+console.log("Hello from Liked Posts Function!")
+
 import { serve } from 'https://deno.land/std@0.177.0/http/server.ts';
 import { Pool } from 'https://deno.land/x/postgres@v0.17.0/mod.ts';
 import * as postgres from 'https://deno.land/x/postgres@v0.17.0/mod.ts';
@@ -141,6 +150,40 @@ serve(async (req: Request) => {
       );
     }
 
+    // Verify user authentication
+    const authHeader = req.headers.get('Authorization');
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return new Response(
+        JSON.stringify({ 
+          success: false, 
+          error: 'Authentication required' 
+        }),
+        { status: 401, headers }
+      );
+    }
+
+    // Create a Supabase client and authenticate the user
+    const supabaseUrl = Deno.env.get('SUPABASE_URL') || '';
+    const supabaseAnonKey = Deno.env.get('SUPABASE_ANON_KEY') || '';
+    const supabase = createClient(supabaseUrl, supabaseAnonKey);
+    
+    const token = authHeader.replace('Bearer ', '');
+    
+    // Verify the token and get user information
+    const { data: { user }, error: authError } = await supabase.auth.getUser(token);
+    
+    if (authError || !user) {
+      return new Response(
+        JSON.stringify({ 
+          success: false, 
+          error: 'Invalid authentication token' 
+        }),
+        { status: 401, headers }
+      );
+    }
+
+    const currentUserId = user.id;
+
     // Parse query parameters
     const url = new URL(req.url);
     const params: QueryParams = {
@@ -164,18 +207,18 @@ serve(async (req: Request) => {
     const client = await pool.connect();
 
     try {
-      // Get total count for pagination
-      const countQuery = `SELECT COUNT(*) as total FROM posts`;
-      const countResult = await client.queryObject<{ total: postgres.BigInt }>(countQuery);
+      // Get total count of user's liked posts for pagination
+      const countQuery = `
+        SELECT COUNT(*) as total 
+        FROM user_liked_posts 
+        WHERE user_id = $1
+      `;
+      const countResult = await client.queryObject<{ total: postgres.BigInt }>(countQuery, [currentUserId]);
       const total = Number(countResult.rows[0].total);
 
-      // Build the main query with like count
-      const sortClause = `ORDER BY created_at DESC`;
+      // Build the main query to get all liked posts
+      const sortClause = `ORDER BY p.created_at DESC`;
       
-      let paramCounter = 1;
-      const paginationClause = `LIMIT $${paramCounter++} OFFSET $${paramCounter++}`;
-      const queryParams = [params.limit, offset];
-
       // Get posts with like count and user profile
       const postQuery = `
         SELECT 
@@ -189,6 +232,8 @@ serve(async (req: Request) => {
           c.name as category_name
         FROM 
           posts p
+        JOIN
+          user_liked_posts ul ON p.id = ul.post_id AND ul.user_id = $1
         LEFT JOIN 
           user_liked_posts ulp ON p.id = ulp.post_id
         LEFT JOIN
@@ -198,11 +243,11 @@ serve(async (req: Request) => {
         GROUP BY 
           p.id, pr.id, c.id
         ${sortClause}
-        ${paginationClause}
+        LIMIT $2 OFFSET $3
       `;
 
       // Execute the query to get posts
-      const postResult = await client.queryObject(postQuery, queryParams);
+      const postResult = await client.queryObject(postQuery, [currentUserId, params.limit, offset]);
       const posts = processQueryResult(postResult.rows);
 
       // If no posts found, return empty array
@@ -244,45 +289,6 @@ serve(async (req: Request) => {
       const videoResult = await client.queryObject(videoQuery, postIds);
       const videos = processQueryResult(videoResult.rows);
 
-      // Check if user is authenticated
-      let currentUserId: string | null = null;
-      let userLikedPosts: Record<string, boolean> = {};
-      
-      const authHeader = req.headers.get('Authorization');
-      if (authHeader && authHeader.startsWith('Bearer ')) {
-        try {
-          // Create a Supabase client
-          const supabaseUrl = Deno.env.get('SUPABASE_URL') || '';
-          const supabaseAnonKey = Deno.env.get('SUPABASE_ANON_KEY') || '';
-          const supabase = createClient(supabaseUrl, supabaseAnonKey);
-          
-          const token = authHeader.replace('Bearer ', '');
-          
-          // Verify the token and get user information
-          const { data: { user }, error: authError } = await supabase.auth.getUser(token);
-          
-          if (!authError && user) {
-            currentUserId = user.id;
-            
-            // Get user's liked posts - using a different approach for placeholders
-            const userLikedPlaceholders = postIds.map((_, i) => `$${i + 2}`).join(',');
-            const userLikedQuery = `
-              SELECT post_id FROM user_liked_posts
-              WHERE user_id = $1 AND post_id IN (${userLikedPlaceholders})
-            `;
-            const userLikedResult = await client.queryObject(userLikedQuery, [currentUserId, ...postIds]);
-            
-            // Create a map of post_id to liked status
-            userLikedResult.rows.forEach(row => {
-              userLikedPosts[row.post_id] = true;
-            });
-          }
-        } catch (error) {
-          console.error('Error authenticating user:', error);
-          // Continue without authentication
-        }
-      }
-
       // Organize photos and videos by post_id
       const photosByPostId: Record<string, Photo[]> = {};
       const videosByPostId: Record<string, Video[]> = {};
@@ -307,7 +313,7 @@ serve(async (req: Request) => {
         photos: photosByPostId[post.id] || [],
         videos: videosByPostId[post.id] || [],
         like_count: post.like_count || 0,
-        is_liked_by_user: currentUserId ? !!userLikedPosts[post.id] : false,
+        is_liked_by_user: true, // These are all liked posts by the current user
         profile: {
           id: post.profile_id,
           username: post.profile_username,
@@ -360,3 +366,13 @@ serve(async (req: Request) => {
     );
   }
 });
+
+/* To invoke locally:
+
+  1. Run `supabase start` (see: https://supabase.com/docs/reference/cli/supabase-start)
+  2. Make an HTTP request:
+
+  curl -i --location --request GET 'http://127.0.0.1:54321/functions/v1/liked_posts' \
+    --header 'Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZS1kZW1vIiwicm9sZSI6ImFub24iLCJleHAiOjE5ODM4MTI5OTZ9.CRXP1A7WOeoJeXxjNni43kdQwgnWNReilDMblYTn_I0' 
+
+*/
