@@ -2,7 +2,7 @@
 ALTER TABLE public.posts ADD COLUMN description_search tsvector GENERATED ALWAYS AS (to_tsvector('english', description)) STORED;
 
 -- Create GIN index for full-text search on the description_search column
-CREATE INDEX posts_description_search_idx ON public.posts USING GIN (description_search);
+CREATE INDEX IF NOT EXISTS posts_description_search_idx ON public.posts USING GIN (description_search);
 
 -- Function to update the description search vector whenever a post is created or updated
 CREATE OR REPLACE FUNCTION update_post_description_search()
