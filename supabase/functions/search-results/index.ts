@@ -76,11 +76,8 @@ Deno.serve(async (req) => {
           .map(term => `${term}:*`)
           .join(' & ');
         
-        conditions.push(`(
-          title_search @@ to_tsquery('english', $${paramCounter++}) OR
-          to_tsvector('english', description) @@ to_tsquery('english', $${paramCounter++})
-        )`);
-        queryParams.push(processedTerms, processedTerms);
+        conditions.push(`search_document @@ to_tsquery('english', $${paramCounter++})`);
+        queryParams.push(processedTerms);
       }
 
       // Price range conditions
@@ -124,7 +121,7 @@ Deno.serve(async (req) => {
 
       // Build the sort clause based on parameters
       const sortClause = `ORDER BY ${query && sort_by === 'created_at' ? 
-        `ts_rank(title_search, to_tsquery('english', $1)) DESC, created_at DESC` : 
+        `ts_rank(search_document, to_tsquery('english', $1)) DESC, created_at DESC` : 
         `${sort_by} ${sort_direction}`}`;
 
       // Get posts with search conditions, like count and user profile

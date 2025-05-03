@@ -60,24 +60,47 @@ Deno.serve(async (req) => {
     const client = await pool.connect();
     
     try {
-      // Prepare search query with ILIKE for case-insensitive matching
-      // Add % wildcards to search for titles containing the query string
-      const searchPattern = `%${query}%`;
+      // Process the search term for prefix matching
+      const processedTerm = query
+        .split(' ')
+        .filter(Boolean)
+        .map(term => `${term}:*`)
+        .join(' & ');
       
-      // Query posts table for matching titles
-      // Limit to 10 suggestions for performance
+      // Query posts table using the combined full-text search index
       const result = await client.queryObject<{ id: string; title: string }>(
-        `SELECT id, title FROM posts 
-         WHERE title ILIKE $1 
-         ORDER BY created_at DESC 
+        `SELECT id, title, ts_rank(search_document, to_tsquery('english', $1)) as rank
+         FROM posts 
+         WHERE search_document @@ to_tsquery('english', $1)
+         ORDER BY rank DESC, created_at DESC 
          LIMIT 10`,
-        [searchPattern]
+        [processedTerm]
       );
+      
+      // If no exact matches found via full-text search, fall back to ILIKE
+      if (result.rows.length < 5) {
+        const searchPattern = `%${query}%`;
+        const fallbackResult = await client.queryObject<{ id: string; title: string }>(
+          `SELECT id, title FROM posts 
+           WHERE title ILIKE $1 AND id NOT IN (SELECT id FROM (
+             SELECT id FROM posts WHERE search_document @@ to_tsquery('english', $2) LIMIT 10
+           ) as existing_results)
+           ORDER BY created_at DESC 
+           LIMIT ${10 - result.rows.length}`,
+          [searchPattern, processedTerm]
+        );
+        
+        // Combine results
+        result.rows = [...result.rows, ...fallbackResult.rows];
+      }
       
       // Prepare response
       const response: SuggestionResponse = {
         success: true,
-        suggestions: result.rows
+        suggestions: result.rows.map(row => ({
+          id: row.id,
+          title: row.title
+        }))
       };
       
       return new Response(
